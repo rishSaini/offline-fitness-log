@@ -1,28 +1,33 @@
-export const API_URL = "http://192.168.1.20:8000";
+export const API_URL = "https://loose-ideas-stand.loca.lt";
 ; 
-// Android emulator: http://10.0.2.2:8000
-// Physical device: http://YOUR_LAPTOP_IP:8000
+type TokenResponse = { access_token: string; token_type: string };
 
-export async function signup(email: string, password: string) {
+async function parseError(res: Response) {
+  const text = await res.text();
+  try {
+    const j = JSON.parse(text);
+    return j?.detail ? JSON.stringify(j.detail) : text;
+  } catch {
+    return text;
+  }
+}
+
+export async function signup(email: string, password: string): Promise<TokenResponse> {
   const res = await fetch(`${API_URL}/auth/signup`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ email, password }),
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw new Error(await parseError(res));
   return res.json();
 }
 
-export async function login(email: string, password: string) {
-  const form = new URLSearchParams();
-  form.append("username", email);
-  form.append("password", password);
-
+export async function login(email: string, password: string): Promise<TokenResponse> {
   const res = await fetch(`${API_URL}/auth/login`, {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: form.toString(),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
   });
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) throw new Error(await parseError(res));
   return res.json();
 }

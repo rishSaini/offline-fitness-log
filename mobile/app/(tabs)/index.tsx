@@ -63,6 +63,7 @@ export default function HomeScreen() {
 
   async function handleSignup() {
     try {
+      Alert.alert("Debug", `pw length: ${password.length}`);
       const res = await signup(email, password);
       setToken(res.access_token);
       Alert.alert("Signed up", "You are logged in.");
