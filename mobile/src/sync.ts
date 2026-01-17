@@ -6,16 +6,37 @@ import {
   upsertLocalWorkout,
 } from "./db";
 
-export async function syncNow(token: string) {
-  const pending = await getPendingOps(100);
-  if (pending.length === 0) return { ok: true, message: "Nothing to sync" };
+function safeJsonParse(s: string | null) {
+  if (!s) return null;
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
 
-  const ops = pending.map((row: any) => ({
-    op_id: row.op_id,
-    type: row.type,
-    entity_id: row.entity_id,
-    payload: row.payload ? JSON.parse(row.payload) : null,
-    client_updated_at: row.client_updated_at,
+async function readErr(res: Response) {
+  const t = await res.text();
+  try {
+    const j = JSON.parse(t);
+    return j?.detail ? JSON.stringify(j.detail) : t;
+  } catch {
+    return t;
+  }
+}
+
+export async function syncNow(token: string) {
+  const pending = await getPendingOps(50);
+  if (pending.length === 0) {
+    return { applied_op_ids: [], updated_entities: [], conflicts: [] };
+  }
+
+  const ops = pending.map((p) => ({
+    op_id: p.op_id,
+    type: p.type,
+    entity_id: p.entity_id,
+    payload: safeJsonParse(p.payload),
+    client_updated_at: p.client_updated_at,
   }));
 
   const res = await fetch(`${API_URL}/sync/push`, {
@@ -28,30 +49,29 @@ export async function syncNow(token: string) {
   });
 
   if (!res.ok) {
-    await markOpsFailed(pending.map((p: any) => p.op_id));
-    throw new Error(await res.text());
+    // Don't lose ops; mark failed (optional) but keep them for debugging
+    const msg = await readErr(res);
+    throw new Error(msg);
   }
 
   const data = await res.json();
 
-  // Mark applied ops done
-  const appliedIds = (data.applied_op_ids || []).map((x: any) => String(x));
-  await markOpsDone(appliedIds);
+  // mark ops done
+  const applied: string[] = data.applied_op_ids ?? [];
+  await markOpsDone(applied);
 
-  // Reconcile: server is canonical for any returned entities
-  for (const ent of data.updated_entities || []) {
-    if (ent.kind === "workout") {
-      await upsertLocalWorkout(ent.data);
-    }
-    // sets omitted in UI MVP, but server supports them
-  }
-
-  // Conflicts: overwrite local with server copy (MVP resolution)
-  for (const c of data.conflicts || []) {
-    if (c.entity?.kind === "workout") {
-      await upsertLocalWorkout(c.entity.data);
+  // reconcile local with server “truth”
+  const updated = data.updated_entities ?? [];
+  for (const item of updated) {
+    if (item.entity === "workout" && item.data) {
+      await upsertLocalWorkout(item.data);
     }
   }
 
-  return { ok: true, applied: appliedIds.length, conflicts: (data.conflicts || []).length };
+  // if you want, mark conflicts as DONE too (server wins in our backend impl)
+  const conflicts = data.conflicts ?? [];
+  const conflictOpIds = conflicts.map((c: any) => c.op_id).filter(Boolean);
+  if (conflictOpIds.length) await markOpsDone(conflictOpIds);
+
+  return data;
 }

@@ -1,220 +1,267 @@
 from __future__ import annotations
 
-import time
+import os
+import uuid
 from datetime import datetime, timezone
+from typing import Any, Literal
 
-from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Header, HTTPException
+from jose import JWTError, jwt
+from pydantic import BaseModel
 
-from app.api.deps import get_db, get_current_user
-from app.models.user import User
-from app.models.sync_op import SyncOp
-from app.models.workout import Workout, WorkoutSet
-from app.schemas.sync import SyncPushRequest, SyncPushResponse, EntityOut, ConflictOut
-
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
 
 router = APIRouter(prefix="/sync", tags=["sync"])
 
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql+psycopg://fitness:fitness@localhost:5432/fitness",
+)
 
-def _dt_iso(dt: datetime | None) -> str | None:
-    return dt.astimezone(timezone.utc).isoformat() if dt else None
+JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
+JWT_ALG = "HS256"
 
-
-def _serialize_workout(w: Workout) -> dict:
-    return {
-        "id": str(w.id),
-        "user_id": str(w.user_id),
-        "type": w.type,
-        "started_at": _dt_iso(w.started_at),
-        "notes": w.notes,
-        "distance_m": w.distance_m,
-        "duration_s": w.duration_s,
-        "rpe": w.rpe,
-        "version": w.version,
-        "updated_at": _dt_iso(w.updated_at),
-        "deleted_at": _dt_iso(w.deleted_at),
-    }
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
-def _serialize_set(s: WorkoutSet) -> dict:
-    return {
-        "id": str(s.id),
-        "user_id": str(s.user_id),
-        "workout_id": str(s.workout_id),
-        "position": s.position,
-        "exercise_name": s.exercise_name,
-        "reps": s.reps,
-        "weight_kg": float(s.weight_kg) if s.weight_kg is not None else None,
-        "distance_m": s.distance_m,
-        "duration_s": s.duration_s,
-        "notes": s.notes,
-        "version": s.version,
-        "updated_at": _dt_iso(s.updated_at),
-        "deleted_at": _dt_iso(s.deleted_at),
-    }
+class SyncOp(BaseModel):
+    op_id: uuid.UUID
+    type: Literal["UPSERT_WORKOUT", "DELETE_WORKOUT"]
+    entity_id: uuid.UUID
+    payload: dict[str, Any] | None = None
+    client_updated_at: int
 
 
-@router.post("/push", response_model=SyncPushResponse)
-def sync_push(
-    req: SyncPushRequest,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    applied_op_ids: list = []
-    updated_entities: list[EntityOut] = []
-    conflicts: list[ConflictOut] = []
+class SyncPushRequest(BaseModel):
+    ops: list[SyncOp]
 
-    now = datetime.now(timezone.utc)
 
-    for op in req.ops:
-        # Idempotency: if already applied, skip
-        if db.get(SyncOp, op.op_id):
-            applied_op_ids.append(op.op_id)
-            continue
+class SyncResponse(BaseModel):
+    applied_op_ids: list[str]
+    updated_entities: list[dict[str, Any]]
+    conflicts: list[dict[str, Any]]
+    server_time_ms: int
 
-        if op.type == "UPSERT_WORKOUT":
-            payload = op.payload or {}
-            client_version = int(payload.get("version") or 0)
 
-            existing: Workout | None = (
-                db.query(Workout)
-                .filter(Workout.id == op.entity_id, Workout.user_id == user.id)
-                .one_or_none()
-            )
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
-            if existing and client_version < existing.version:
-                conflicts.append(
-                    ConflictOut(
-                        op_id=op.op_id,
-                        type=op.type,
-                        entity=EntityOut(kind="workout", data=_serialize_workout(existing)),
+
+def _get_user_id_from_auth(authorization: str | None) -> uuid.UUID:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing/invalid Authorization header")
+
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+        sub = payload.get("sub")
+        if not sub:
+            raise HTTPException(status_code=401, detail="Token missing subject")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    # sub might be uuid (recommended) or email
+    user_id: uuid.UUID | None = None
+    try:
+        user_id = uuid.UUID(str(sub))
+    except Exception:
+        user_id = None
+
+    with SessionLocal() as db:
+        if user_id is not None:
+            row = db.execute(
+                text("SELECT id FROM users WHERE id = :id"),
+                {"id": str(user_id)},
+            ).fetchone()
+            if row:
+                return uuid.UUID(str(row[0]))
+
+        # treat as email
+        row = db.execute(
+            text("SELECT id FROM users WHERE email = :email"),
+            {"email": str(sub)},
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=401, detail="User not found")
+        return uuid.UUID(str(row[0]))
+
+
+@router.post("/push", response_model=SyncResponse)
+def push(req: SyncPushRequest, authorization: str | None = Header(default=None)):
+    user_id = _get_user_id_from_auth(authorization)
+    applied: list[str] = []
+    updated_entities: list[dict[str, Any]] = []
+    conflicts: list[dict[str, Any]] = []
+    now = _now()
+
+    with SessionLocal() as db:
+        for op in req.ops:
+            if op.type == "UPSERT_WORKOUT":
+                if not op.payload:
+                    # nothing to apply; mark as done
+                    applied.append(str(op.op_id))
+                    continue
+
+                w = op.payload
+                workout_id = str(w.get("id") or op.entity_id)
+                wtype = w.get("type")
+                started_at = w.get("started_at")
+                notes = w.get("notes")
+                distance_m = w.get("distance_m")
+                duration_s = w.get("duration_s")
+                rpe = w.get("rpe")
+                client_version = int(w.get("version") or 0)
+
+                # Fetch server version
+                row = db.execute(
+                    text("""
+                        SELECT id, type, started_at, notes, distance_m, duration_s, rpe,
+                               version, updated_at, deleted_at
+                        FROM workouts
+                        WHERE id = :id AND user_id = :user_id
+                    """),
+                    {"id": workout_id, "user_id": str(user_id)},
+                ).fetchone()
+
+                if row is None:
+                    # Insert as version 1
+                    db.execute(
+                    text("""
+                        INSERT INTO workouts
+                        (id, user_id, type, started_at, notes, distance_m, duration_s, rpe, version, updated_at, deleted_at)
+                        VALUES
+                        (:id, :user_id, :type, CAST(:started_at AS timestamptz), :notes, :distance_m, :duration_s, :rpe, 1, CAST(:updated_at AS timestamptz), NULL)
+                        """),
+                        {
+                            "id": workout_id,
+                            "user_id": str(user_id),
+                            "type": wtype,
+                            "started_at": started_at,
+                            "notes": notes,
+                            "distance_m": distance_m,
+                            "duration_s": duration_s,
+                            "rpe": rpe,
+                            "updated_at": now.isoformat(),
+                        },
                     )
+                    server_version = 1
+                else:
+                    server_version = int(row[7] or 0)
+
+                    # conflict: server ahead
+                    if client_version < server_version:
+                        conflicts.append(
+                            {
+                                "op_id": str(op.op_id),
+                                "entity": "workout",
+                                "entity_id": workout_id,
+                                "reason": "client_version_behind",
+                                "server": {
+                                    "id": str(row[0]),
+                                    "type": row[1],
+                                    "started_at": row[2].isoformat() if row[2] else None,
+                                    "notes": row[3],
+                                    "distance_m": row[4],
+                                    "duration_s": row[5],
+                                    "rpe": row[6],
+                                    "version": server_version,
+                                    "updated_at": row[8].isoformat() if row[8] else None,
+                                    "deleted_at": row[9].isoformat() if row[9] else None,
+                                },
+                            }
+                        )
+                        # For MVP: server wins, mark op as applied and also return server state as “updated entity”
+                        applied.append(str(op.op_id))
+                        updated_entities.append({"entity": "workout", "data": conflicts[-1]["server"]})
+                        continue
+
+                    # apply update
+                    new_version = server_version + 1
+                    db.execute(
+                    text("""
+                        UPDATE workouts SET
+                        type = :type,
+                        started_at = CAST(:started_at AS timestamptz),
+                        notes = :notes,
+                        distance_m = :distance_m,
+                        duration_s = :duration_s,
+                        rpe = :rpe,
+                        version = :version,
+                        updated_at = CAST(:updated_at AS timestamptz),
+                        deleted_at = NULL
+                        WHERE id = :id AND user_id = :user_id
+                    """),
+                    {
+                        "id": workout_id,
+                        "user_id": str(user_id),
+                        "type": wtype,
+                        "started_at": started_at,
+                        "notes": notes,
+                        "distance_m": distance_m,
+                        "duration_s": duration_s,
+                        "rpe": rpe,
+                        "version": new_version,
+                        "updated_at": now.isoformat(),
+                    },
                 )
-                continue
 
-            if not existing:
-                w = Workout(
-                    id=op.entity_id,
-                    user_id=user.id,
-                    type=str(payload["type"]),
-                    started_at=datetime.fromisoformat(payload["started_at"]),
-                    notes=payload.get("notes"),
-                    distance_m=payload.get("distance_m"),
-                    duration_s=payload.get("duration_s"),
-                    rpe=payload.get("rpe"),
-                    version=1,
-                    updated_at=now,
-                    deleted_at=None,
+                    server_version = new_version
+
+                # return server copy so mobile can update local version
+                updated_entities.append(
+                    {
+                        "entity": "workout",
+                        "data": {
+                            "id": workout_id,
+                            "type": wtype,
+                            "started_at": started_at,
+                            "notes": notes,
+                            "distance_m": distance_m,
+                            "duration_s": duration_s,
+                            "rpe": rpe,
+                            "version": server_version,
+                            "updated_at": now.isoformat(),
+                            "deleted_at": None,
+                        },
+                    }
                 )
-                db.add(w)
-                db.flush()
-                updated_entities.append(EntityOut(kind="workout", data=_serialize_workout(w)))
-            else:
-                existing.type = str(payload.get("type", existing.type))
-                if payload.get("started_at"):
-                    existing.started_at = datetime.fromisoformat(payload["started_at"])
-                existing.notes = payload.get("notes", existing.notes)
-                existing.distance_m = payload.get("distance_m", existing.distance_m)
-                existing.duration_s = payload.get("duration_s", existing.duration_s)
-                existing.rpe = payload.get("rpe", existing.rpe)
-                existing.version = existing.version + 1
-                existing.updated_at = now
-                updated_entities.append(EntityOut(kind="workout", data=_serialize_workout(existing)))
+                applied.append(str(op.op_id))
 
-            db.add(SyncOp(op_id=op.op_id, user_id=user.id))
-            applied_op_ids.append(op.op_id)
-
-        elif op.type == "DELETE_WORKOUT":
-            existing: Workout | None = (
-                db.query(Workout)
-                .filter(Workout.id == op.entity_id, Workout.user_id == user.id)
-                .one_or_none()
-            )
-            if existing and existing.deleted_at is None:
-                existing.deleted_at = now
-                existing.version += 1
-                existing.updated_at = now
-                updated_entities.append(EntityOut(kind="workout", data=_serialize_workout(existing)))
-
-            db.add(SyncOp(op_id=op.op_id, user_id=user.id))
-            applied_op_ids.append(op.op_id)
-
-        elif op.type == "UPSERT_SET":
-            payload = op.payload or {}
-            client_version = int(payload.get("version") or 0)
-
-            existing: WorkoutSet | None = (
-                db.query(WorkoutSet)
-                .filter(WorkoutSet.id == op.entity_id, WorkoutSet.user_id == user.id)
-                .one_or_none()
-            )
-
-            if existing and client_version < existing.version:
-                conflicts.append(
-                    ConflictOut(
-                        op_id=op.op_id,
-                        type=op.type,
-                        entity=EntityOut(kind="workout_set", data=_serialize_set(existing)),
-                    )
+            elif op.type == "DELETE_WORKOUT":
+                workout_id = str(op.entity_id)
+                # soft delete
+                row = db.execute(
+                    text("SELECT version FROM workouts WHERE id=:id AND user_id=:user_id"),
+                    {"id": workout_id, "user_id": str(user_id)},
+                ).fetchone()
+                if row:
+                    new_version = int(row[0] or 0) + 1
+                    db.execute(
+                        text("""
+                            UPDATE workouts SET
+                            deleted_at = CAST(:deleted_at AS timestamptz),
+                            updated_at = CAST(:updated_at AS timestamptz),
+                            version = :version
+                            WHERE id = :id AND user_id = :user_id
+                        """),
+                    {
+                        "id": workout_id,
+                        "user_id": str(user_id),
+                        "deleted_at": now.isoformat(),
+                        "updated_at": now.isoformat(),
+                        "version": new_version,
+                    },
                 )
-                continue
 
-            if not existing:
-                s = WorkoutSet(
-                    id=op.entity_id,
-                    user_id=user.id,
-                    workout_id=payload["workout_id"],
-                    position=int(payload.get("position") or 0),
-                    exercise_name=payload.get("exercise_name"),
-                    reps=payload.get("reps"),
-                    weight_kg=payload.get("weight_kg"),
-                    distance_m=payload.get("distance_m"),
-                    duration_s=payload.get("duration_s"),
-                    notes=payload.get("notes"),
-                    version=1,
-                    updated_at=now,
-                    deleted_at=None,
-                )
-                db.add(s)
-                db.flush()
-                updated_entities.append(EntityOut(kind="workout_set", data=_serialize_set(s)))
-            else:
-                if payload.get("workout_id"):
-                    existing.workout_id = payload["workout_id"]
-                existing.position = int(payload.get("position", existing.position))
-                existing.exercise_name = payload.get("exercise_name", existing.exercise_name)
-                existing.reps = payload.get("reps", existing.reps)
-                existing.weight_kg = payload.get("weight_kg", existing.weight_kg)
-                existing.distance_m = payload.get("distance_m", existing.distance_m)
-                existing.duration_s = payload.get("duration_s", existing.duration_s)
-                existing.notes = payload.get("notes", existing.notes)
-                existing.version += 1
-                existing.updated_at = now
-                updated_entities.append(EntityOut(kind="workout_set", data=_serialize_set(existing)))
+                applied.append(str(op.op_id))
 
-            db.add(SyncOp(op_id=op.op_id, user_id=user.id))
-            applied_op_ids.append(op.op_id)
+        db.commit()
 
-        elif op.type == "DELETE_SET":
-            existing: WorkoutSet | None = (
-                db.query(WorkoutSet)
-                .filter(WorkoutSet.id == op.entity_id, WorkoutSet.user_id == user.id)
-                .one_or_none()
-            )
-            if existing and existing.deleted_at is None:
-                existing.deleted_at = now
-                existing.version += 1
-                existing.updated_at = now
-                updated_entities.append(EntityOut(kind="workout_set", data=_serialize_set(existing)))
-
-            db.add(SyncOp(op_id=op.op_id, user_id=user.id))
-            applied_op_ids.append(op.op_id)
-
-    db.commit()
-
-    return SyncPushResponse(
-        applied_op_ids=applied_op_ids,
+    return SyncResponse(
+        applied_op_ids=applied,
         updated_entities=updated_entities,
         conflicts=conflicts,
-        server_time_ms=int(time.time() * 1000),
+        server_time_ms=int(now.timestamp() * 1000),
     )
