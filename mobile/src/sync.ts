@@ -1,77 +1,77 @@
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { API_URL } from "./api";
-import {
-  getPendingOps,
-  markOpsDone,
-  markOpsFailed,
-  upsertLocalWorkout,
-} from "./db";
+import { upsertLocalWorkout, getPendingOps, markOpsDone } from "./db";
 
-function safeJsonParse(s: string | null) {
-  if (!s) return null;
-  try {
-    return JSON.parse(s);
-  } catch {
-    return null;
-  }
+const LAST_SYNC_KEY = "last_sync_ms";
+
+async function getLastSyncMs() {
+  const v = await AsyncStorage.getItem(LAST_SYNC_KEY);
+  return v ? parseInt(v, 10) : 0;
 }
 
-async function readErr(res: Response) {
-  const t = await res.text();
-  try {
-    const j = JSON.parse(t);
-    return j?.detail ? JSON.stringify(j.detail) : t;
-  } catch {
-    return t;
-  }
+async function setLastSyncMs(ms: number) {
+  await AsyncStorage.setItem(LAST_SYNC_KEY, String(ms));
 }
 
-export async function syncNow(token: string) {
-  const pending = await getPendingOps(50);
-  if (pending.length === 0) {
-    return { applied_op_ids: [], updated_entities: [], conflicts: [] };
-  }
-
-  const ops = pending.map((p) => ({
-    op_id: p.op_id,
-    type: p.type,
-    entity_id: p.entity_id,
-    payload: safeJsonParse(p.payload),
-    client_updated_at: p.client_updated_at,
-  }));
-
-  const res = await fetch(`${API_URL}/sync/push`, {
-    method: "POST",
+async function pullChanges(token: string, sinceMs: number) {
+  const res = await fetch(`${API_URL}/sync/pull?since=${sinceMs}`, {
+    method: "GET",
     headers: {
-      "Content-Type": "application/json",
       Authorization: `Bearer ${token}`,
     },
-    body: JSON.stringify({ ops }),
   });
 
   if (!res.ok) {
-    // Don't lose ops; mark failed (optional) but keep them for debugging
-    const msg = await readErr(res);
-    throw new Error(msg);
+    const text = await res.text();
+    throw new Error(text);
   }
 
   const data = await res.json();
 
-  // mark ops done
-  const applied: string[] = data.applied_op_ids ?? [];
-  await markOpsDone(applied);
-
-  // reconcile local with server “truth”
-  const updated = data.updated_entities ?? [];
-  for (const item of updated) {
-    if (item.entity === "workout" && item.data) {
-      await upsertLocalWorkout(item.data);
-    }
+  const workouts = data.workouts ?? [];
+  for (const w of workouts) {
+    // If your local UI should hide deleted workouts later, we’ll handle that in Step 4.
+    await upsertLocalWorkout(w);
   }
 
-  // if you want, mark conflicts as DONE too (server wins in our backend impl)
-  const conflicts = data.conflicts ?? [];
-  const conflictOpIds = conflicts.map((c: any) => c.op_id).filter(Boolean);
-  if (conflictOpIds.length) await markOpsDone(conflictOpIds);
+  const serverTime = data.server_time_ms ?? Date.now();
+  await setLastSyncMs(serverTime);
 
   return data;
 }
+
+export async function syncNow(token: string) {
+  const sinceMs = await getLastSyncMs();
+
+  // --- PUSH ---
+  const pending = await getPendingOps(50);
+  if (pending.length) {
+    const ops = pending.map((p) => ({
+      op_id: p.op_id,
+      type: p.type,
+      entity_id: p.entity_id,
+      payload: p.payload ? JSON.parse(p.payload) : null, 
+      client_updated_at: p.client_updated_at,
+    }));
+
+    const pushRes = await fetch(`${API_URL}/sync/push`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ ops }),
+    });
+
+    if (!pushRes.ok) throw new Error(await pushRes.text());
+    const pushData = await pushRes.json();
+
+    await markOpsDone(pushData.applied_op_ids ?? []);
+  }
+
+  // --- PULL ---
+  const pullData = await pullChanges(token, sinceMs);
+
+  return { ok: true, pulled: pullData.workouts?.length ?? 0 };
+}
+

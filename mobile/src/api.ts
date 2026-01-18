@@ -1,5 +1,5 @@
-export const API_URL = "https://thick-carpets-wink.loca.lt";
-; 
+export const API_URL = "https://slick-rats-scream.loca.lt";
+
 type TokenResponse = { access_token: string; token_type: string };
 
 async function parseError(res: Response) {

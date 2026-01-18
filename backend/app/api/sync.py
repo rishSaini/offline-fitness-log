@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Query
 from jose import JWTError, jwt
 from pydantic import BaseModel
 
@@ -37,6 +37,59 @@ class SyncOp(BaseModel):
 class SyncPushRequest(BaseModel):
     ops: list[SyncOp]
 
+class SyncPullResponse(BaseModel):
+    server_time_ms: int
+    workouts: list[dict[str, Any]]
+
+@router.get("/pull", response_model=SyncPullResponse)
+def pull(
+    since: int = Query(0, description="Last sync server_time_ms (epoch ms)"),
+    authorization: str | None = Header(default=None),
+):
+    user_id = _get_user_id_from_auth(authorization)
+
+    # convert ms -> datetime
+    since_dt = datetime.fromtimestamp(since / 1000.0, tz=timezone.utc)
+    now = _now()
+
+    with SessionLocal() as db:
+        rows = db.execute(
+            text("""
+                SELECT id, type, started_at, notes, distance_m, duration_s, rpe,
+                       version, updated_at, deleted_at
+                FROM workouts
+                WHERE user_id = :user_id
+                  AND (
+                    (updated_at IS NOT NULL AND updated_at > :since_dt)
+                    OR
+                    (deleted_at IS NOT NULL AND deleted_at > :since_dt)
+                  )
+                ORDER BY updated_at ASC NULLS LAST
+            """),
+            {"user_id": str(user_id), "since_dt": since_dt},
+        ).fetchall()
+
+    workouts: list[dict[str, Any]] = []
+    for r in rows:
+        workouts.append(
+            {
+                "id": str(r[0]),
+                "type": r[1],
+                "started_at": r[2].isoformat() if r[2] else None,
+                "notes": r[3],
+                "distance_m": r[4],
+                "duration_s": r[5],
+                "rpe": r[6],
+                "version": int(r[7] or 0),
+                "updated_at": r[8].isoformat() if r[8] else None,
+                "deleted_at": r[9].isoformat() if r[9] else None,
+            }
+        )
+
+    return SyncPullResponse(
+        server_time_ms=int(now.timestamp() * 1000),
+        workouts=workouts,
+    )
 
 class SyncResponse(BaseModel):
     applied_op_ids: list[str]

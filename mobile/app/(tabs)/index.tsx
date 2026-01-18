@@ -7,6 +7,7 @@ import { v4 as uuidv4 } from "uuid";
 import { initDb, listLocalWorkouts, upsertLocalWorkout, enqueueOp } from "../../src/db";
 import { login, signup } from "../../src/api";
 import { syncNow } from "../../src/sync";
+import { devResetAllLocal } from "../../src/devReset";
 
 type Workout = {
   id: string;
@@ -52,7 +53,7 @@ export default function HomeScreen() {
 
   useEffect(() => {
     if (token && isOnline) {
-      syncNow(token).catch(() => {});
+      syncNow(token).catch(() => { });
     }
   }, [token, isOnline]);
 
@@ -250,6 +251,15 @@ export default function HomeScreen() {
         </View>
 
         <Button title="Sync Now" onPress={handleSyncNow} />
+        <Button
+          title="DEV: Reset Local Data"
+          onPress={async () => {
+            await devResetAllLocal();
+            Alert.alert("Done", "Cleared local SQLite + last_sync_ms.");
+            await refreshWorkouts(); // if you have this function
+          }}
+        />
+
       </View>
 
       <View style={{ paddingHorizontal: 12, paddingBottom: 8 }}>

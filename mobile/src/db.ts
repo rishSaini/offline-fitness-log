@@ -176,3 +176,15 @@ export async function markOpsFailed(opIds: string[]) {
     ...opIds
   );
 }
+
+export async function resetLocalDb() {
+  // wipe local tables
+  await exec(`
+    DELETE FROM sync_queue;
+    DELETE FROM workout_sets;
+    DELETE FROM workouts;
+  `);
+
+  // optional: reclaim space
+  // await exec(`VACUUM;`);
+}
